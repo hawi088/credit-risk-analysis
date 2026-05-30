@@ -1,7 +1,7 @@
 # Data files (DO NOT COMMIT)
 data/raw/
 data/processed/
-
+data/
 # MLflow tracking (DO NOT COMMIT)
 mlruns/
 .mlflow/
