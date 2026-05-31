@@ -1,6 +1,6 @@
 """
 Feature Engineering Pipeline for Credit Risk Model
-Task 3 - Complete Implementation
+Task 3 & 4 - Complete Implementation with Proxy Target Variable
 """
 
 import pandas as pd
@@ -10,6 +10,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
+from sklearn.cluster import KMeans
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -90,14 +91,6 @@ class CustomerAggregator(BaseEstimator, TransformerMixin):
 class TimeFeatureExtractor(BaseEstimator, TransformerMixin):
     """
     Extracts time-based features from transaction timestamps.
-    
-    Creates:
-    - TransactionHour: Hour of day (0-23)
-    - TransactionDay: Day of month (1-31)
-    - TransactionMonth: Month (1-12)
-    - TransactionYear: Year
-    - TransactionDayOfWeek: Day of week (0=Monday, 6=Sunday)
-    - IsWeekend: Binary flag (1=weekend, 0=weekday)
     """
     
     def __init__(self):
@@ -122,9 +115,7 @@ class TimeFeatureExtractor(BaseEstimator, TransformerMixin):
 
 
 class TransactionTimeAggregator(BaseEstimator, TransformerMixin):
-    """
-    Aggregates transaction-level time features to customer level.
-    """
+    """Aggregates transaction-level time features to customer level."""
     
     def __init__(self):
         pass
@@ -135,7 +126,6 @@ class TransactionTimeAggregator(BaseEstimator, TransformerMixin):
     def transform(self, X, y=None):
         df = X.copy()
         
-        # Aggregate time features per customer
         time_features = df.groupby('CustomerId').agg({
             'TransactionHour': ['mean', 'std'],
             'TransactionDay': ['mean', 'std'],
@@ -153,7 +143,6 @@ class TransactionTimeAggregator(BaseEstimator, TransformerMixin):
         ]
         time_features = time_features.reset_index()
         
-        # Fill NaN values for customers with single transaction
         for col in ['StdTransactionHour', 'StdTransactionDay', 'StdTransactionMonth', 'StdDayOfWeek']:
             time_features[col] = time_features[col].fillna(0)
         
@@ -161,14 +150,7 @@ class TransactionTimeAggregator(BaseEstimator, TransformerMixin):
 
 
 class CategoryAggregator(BaseEstimator, TransformerMixin):
-    """
-    Aggregates categorical feature distributions per customer.
-    
-    Creates:
-    - TopProductCategory: Most frequent product category
-    - TopChannelId: Most frequent channel
-    - ProductCategoryDiversity: Number of unique product categories
-    """
+    """Aggregates categorical feature distributions per customer."""
     
     def __init__(self):
         pass
@@ -179,16 +161,18 @@ class CategoryAggregator(BaseEstimator, TransformerMixin):
     def transform(self, X, y=None):
         df = X.copy()
         
-        # Most frequent product category per customer
         if 'ProductCategory' in df.columns:
             most_frequent_category = df.groupby('CustomerId')['ProductCategory'].agg(
                 lambda x: x.mode()[0] if len(x.mode()) > 0 else 'unknown'
             ).reset_index(name='TopProductCategory')
+            category_diversity = df.groupby('CustomerId')['ProductCategory'].nunique().reset_index(
+                name='ProductCategoryDiversity')
         else:
             most_frequent_category = pd.DataFrame({'CustomerId': df['CustomerId'].unique(), 
                                                     'TopProductCategory': 'unknown'})
+            category_diversity = pd.DataFrame({'CustomerId': df['CustomerId'].unique(), 
+                                                'ProductCategoryDiversity': 0})
         
-        # Most frequent channel per customer
         if 'ChannelId' in df.columns:
             most_frequent_channel = df.groupby('CustomerId')['ChannelId'].agg(
                 lambda x: x.mode()[0] if len(x.mode()) > 0 else 'unknown'
@@ -196,14 +180,6 @@ class CategoryAggregator(BaseEstimator, TransformerMixin):
         else:
             most_frequent_channel = pd.DataFrame({'CustomerId': df['CustomerId'].unique(), 
                                                    'TopChannelId': 'unknown'})
-        
-        # Category diversity (number of unique categories)
-        if 'ProductCategory' in df.columns:
-            category_diversity = df.groupby('CustomerId')['ProductCategory'].nunique().reset_index(
-                name='ProductCategoryDiversity')
-        else:
-            category_diversity = pd.DataFrame({'CustomerId': df['CustomerId'].unique(), 
-                                                'ProductCategoryDiversity': 0})
         
         result = most_frequent_category.merge(most_frequent_channel, on='CustomerId', how='outer')
         result = result.merge(category_diversity, on='CustomerId', how='outer')
@@ -237,10 +213,7 @@ class FraudFeatureExtractor(BaseEstimator, TransformerMixin):
 
 
 class LogTransformer(BaseEstimator, TransformerMixin):
-    """
-    Applies log1p transformation to skewed numerical features.
-    Handles negative values by shifting.
-    """
+    """Applies log1p transformation to skewed numerical features."""
     
     def __init__(self, features=None):
         self.features = features
@@ -248,7 +221,6 @@ class LogTransformer(BaseEstimator, TransformerMixin):
         self.shift_values = {}
         
     def fit(self, X, y=None):
-        # Calculate shift values for each feature
         for feature in self.skewed_features:
             if feature in X.columns:
                 min_val = X[feature].min()
@@ -269,11 +241,92 @@ class LogTransformer(BaseEstimator, TransformerMixin):
         return df
 
 
+class RFMClusterer(BaseEstimator, TransformerMixin):
+    """
+    Task 4: Creates proxy target variable using RFM clustering.
+    
+    Steps:
+    1. Take RFM features (Recency, Frequency, Monetary_log)
+    2. Scale the features
+    3. Apply K-Means clustering (k=3)
+    4. Identify highest-risk cluster (lowest F/M, highest R)
+    5. Create is_high_risk binary target column
+    """
+    
+    def __init__(self, n_clusters=3, random_state=42):
+        self.n_clusters = n_clusters
+        self.random_state = random_state
+        self.scaler = StandardScaler()
+        self.kmeans = None
+        self.high_risk_cluster = None
+        self.cluster_profiles = None
+        
+    def fit(self, X, y=None):
+        # Extract RFM features
+        rfm_features = ['Recency', 'Frequency_log', 'Monetary_log']
+        available_features = [f for f in rfm_features if f in X.columns]
+        
+        if len(available_features) < 3:
+            raise ValueError(f"Required RFM features not found. Need Recency, Frequency_log, Monetary_log. Found: {available_features}")
+        
+        X_rfm = X[available_features].copy()
+        
+        # Scale the features
+        X_scaled = self.scaler.fit_transform(X_rfm)
+        
+        # Apply K-Means clustering
+        self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=self.random_state, n_init=10)
+        self.kmeans.fit(X_scaled)
+        
+        # Analyze clusters to identify high-risk group
+        # High-risk = low Frequency, low Monetary, high Recency
+        X_rfm['Cluster'] = self.kmeans.labels_
+        
+        cluster_means = X_rfm.groupby('Cluster').agg({
+            'Frequency_log': 'mean',
+            'Monetary_log': 'mean',
+            'Recency': 'mean'
+        })
+        
+        # Find cluster with lowest Frequency_log + Monetary_log and highest Recency
+        # Normalize each metric to 0-1 range for comparison
+        freq_norm = (cluster_means['Frequency_log'].max() - cluster_means['Frequency_log']) / (cluster_means['Frequency_log'].max() - cluster_means['Frequency_log'].min())
+        monetary_norm = (cluster_means['Monetary_log'].max() - cluster_means['Monetary_log']) / (cluster_means['Monetary_log'].max() - cluster_means['Monetary_log'].min())
+        recency_norm = (cluster_means['Recency'] - cluster_means['Recency'].min()) / (cluster_means['Recency'].max() - cluster_means['Recency'].min())
+        
+        # Risk score = low frequency + low monetary + high recency
+        risk_score = freq_norm + monetary_norm + recency_norm
+        self.high_risk_cluster = risk_score.idxmax()
+        
+        # Store cluster profiles for reporting
+        self.cluster_profiles = cluster_means.copy()
+        self.cluster_profiles['Risk_Score'] = risk_score
+        self.cluster_profiles['Is_High_Risk'] = self.cluster_profiles.index == self.high_risk_cluster
+        
+        return self
+    
+    def transform(self, X, y=None):
+        df = X.copy()
+        
+        # Get cluster labels
+        rfm_features = ['Recency', 'Frequency_log', 'Monetary_log']
+        X_rfm = df[rfm_features].copy()
+        X_scaled = self.scaler.transform(X_rfm)
+        clusters = self.kmeans.predict(X_scaled)
+        
+        # Create high-risk binary target
+        df['is_high_risk'] = (clusters == self.high_risk_cluster).astype(int)
+        df['Cluster'] = clusters
+        
+        return df
+    
+    def get_cluster_report(self):
+        """Returns cluster analysis report"""
+        return self.cluster_profiles
+
+
 class WOETransformer(BaseEstimator, TransformerMixin):
-    """
-    Applies Weight of Evidence (WoE) transformation to categorical features.
-    Requires binary target variable.
-    """
+    """Applies Weight of Evidence (WoE) transformation to categorical features."""
     
     def __init__(self, target_column=None):
         self.target_column = target_column
@@ -286,9 +339,7 @@ class WOETransformer(BaseEstimator, TransformerMixin):
     def transform(self, X, y=None):
         df = X.copy()
         
-        # Check if target column exists
         if self.target_column and self.target_column in df.columns and XVERSE_AVAILABLE:
-            # Identify categorical columns
             self.categorical_features = df.select_dtypes(include=['object']).columns.tolist()
             
             if self.categorical_features:
@@ -300,12 +351,10 @@ class WOETransformer(BaseEstimator, TransformerMixin):
                 self.woe_transformer.fit(X_cat, y_target)
                 X_woe = self.woe_transformer.transform(X_cat)
                 
-                # Add WOE columns and drop original categorical columns
                 for col in X_woe.columns:
                     df[f'{col}_WOE'] = X_woe[col]
                 df = df.drop(self.categorical_features, axis=1)
                 
-                # Print IV values for feature selection
                 iv_df = self.woe_transformer.iv_df
                 print("\nInformation Values (IV) for feature selection:")
                 print(iv_df.to_string(index=False))
@@ -314,18 +363,7 @@ class WOETransformer(BaseEstimator, TransformerMixin):
 
 
 def create_full_pipeline(target_column=None, apply_woe=False):
-    """
-    Creates the complete feature engineering pipeline.
-    
-    Args:
-        target_column: Name of target column for WoE transformation
-        apply_woe: Whether to apply WoE transformation
-    
-    Returns:
-        Pipeline: Complete sklearn pipeline
-    """
-    # This is a meta-pipeline since our transformers work sequentially
-    # We'll implement as a function that applies transformers in order
+    """Creates the complete feature engineering pipeline."""
     
     pipeline_steps = [
         ('aggregator', CustomerAggregator()),
@@ -334,13 +372,11 @@ def create_full_pipeline(target_column=None, apply_woe=False):
         ('category_aggregator', CategoryAggregator()),
         ('fraud_extractor', FraudFeatureExtractor()),
         ('log_transformer', LogTransformer()),
+        ('rfm_clusterer', RFMClusterer()),  # Task 4: Creates proxy target
     ]
     
     if apply_woe and target_column:
         pipeline_steps.append(('woe_transformer', WOETransformer(target_column=target_column)))
-    
-    # Note: Scaler would be applied after train/test split in Task 5
-    # because scaling should be fit on training data only
     
     return pipeline_steps
 
@@ -348,6 +384,7 @@ def create_full_pipeline(target_column=None, apply_woe=False):
 def process_raw_data(df_raw, target_column=None, apply_woe=False):
     """
     Main function to process raw transaction data into model-ready format.
+    Now includes Task 4: Proxy target variable creation via RFM clustering.
     
     Args:
         df_raw: Raw transaction DataFrame
@@ -355,58 +392,80 @@ def process_raw_data(df_raw, target_column=None, apply_woe=False):
         apply_woe: Whether to apply WoE transformation
     
     Returns:
-        DataFrame: Model-ready features
+        DataFrame: Model-ready features with is_high_risk target column
     """
-    print("FEATURE ENGINEERING PIPELINE")
+    print("FEATURE ENGINEERING PIPELINE (Tasks 3 & 4)")
     
     # Step 1: Customer aggregator (RFM features)
-    print("\n[1/7] Creating customer-level RFM features...")
+    print("\n[1/8] Creating customer-level RFM features...")
     aggregator = CustomerAggregator()
     aggregator.fit(df_raw)
     customer_df = aggregator.transform(df_raw)
     print(f"     → Created {customer_df.shape[1]} features for {customer_df.shape[0]} customers")
     
     # Step 2: Time feature extraction
-    print("\n[2/7] Extracting time-based features...")
+    print("\n[2/8] Extracting time-based features...")
     time_extractor = TimeFeatureExtractor()
     df_with_time = time_extractor.transform(df_raw)
     print(f"     → Added hour, day, month, year, dayofweek, weekend flags")
     
     # Step 3: Time feature aggregation
-    print("\n[3/7] Aggregating time features per customer...")
+    print("\n[3/8] Aggregating time features per customer...")
     time_aggregator = TransactionTimeAggregator()
     time_features = time_aggregator.transform(df_with_time)
     print(f"     → Created {time_features.shape[1] - 1} time aggregate features")
     
     # Step 4: Category aggregation
-    print("\n[4/7] Aggregating categorical features...")
+    print("\n[4/8] Aggregating categorical features...")
     category_aggregator = CategoryAggregator()
     category_features = category_aggregator.transform(df_raw)
     print(f"     → Created {category_features.shape[1] - 1} category features")
     
     # Step 5: Fraud feature extraction
-    print("\n[5/7] Extracting fraud features...")
+    print("\n[5/8] Extracting fraud features...")
     fraud_extractor = FraudFeatureExtractor()
     fraud_features = fraud_extractor.transform(df_raw)
     print(f"     → Created FraudCount and FraudRate features")
     
     # Step 6: Merge all features
-    print("\n[6/7] Merging all features...")
+    print("\n[6/8] Merging all features...")
     merged_df = customer_df.merge(time_features, on='CustomerId', how='left')
     merged_df = merged_df.merge(category_features, on='CustomerId', how='left')
     merged_df = merged_df.merge(fraud_features, on='CustomerId', how='left')
     print(f"     → Merged shape: {merged_df.shape}")
     
     # Step 7: Log transformation for skewed features
-    print("\n[7/7] Applying log transformation to skewed features...")
+    print("\n[7/8] Applying log transformation to skewed features...")
     log_transformer = LogTransformer()
     log_transformer.fit(merged_df)
     merged_df = log_transformer.transform(merged_df)
     print(f"     → After log transformation: {merged_df.shape}")
     
-    # Drop CustomerId (identifier)
+    # Step 8: RFM Clustering for Proxy Target (TASK 4)
+    print("\n[8/8] Creating proxy target variable via RFM clustering...")
+    rfm_clusterer = RFMClusterer(n_clusters=3, random_state=42)
+    rfm_clusterer.fit(merged_df)
+    merged_df = rfm_clusterer.transform(merged_df)
+    
+    # Print cluster analysis report
+    print("RFM CLUSTER ANALYSIS (Proxy Target Engineering)")
+    cluster_report = rfm_clusterer.get_cluster_report()
+    print("\nCluster Profiles:")
+    print(cluster_report.to_string())
+    
+    # Print target distribution
+    print("\n" + "-" * 40)
+    target_dist = merged_df['is_high_risk'].value_counts()
+    print(f"Target Distribution (is_high_risk):")
+    print(f"  0 (Low Risk): {target_dist.get(0, 0):,} customers ({target_dist.get(0, 0)/len(merged_df)*100:.1f}%)")
+    print(f"  1 (High Risk): {target_dist.get(1, 0):,} customers ({target_dist.get(1, 0)/len(merged_df)*100:.1f}%)")
+    print("-" * 40)
+    
+    # Drop CustomerId and Cluster columns (Cluster is for analysis only)
     if 'CustomerId' in merged_df.columns:
         merged_df = merged_df.drop(['CustomerId'], axis=1)
+    if 'Cluster' in merged_df.columns:
+        merged_df = merged_df.drop(['Cluster'], axis=1)
     
     # Fill any remaining missing values
     merged_df = merged_df.fillna(0)
@@ -416,26 +475,26 @@ def process_raw_data(df_raw, target_column=None, apply_woe=False):
         print("\n[Optional] Applying WoE transformation...")
         woe_transformer = WOETransformer(target_column=target_column)
         merged_df = woe_transformer.transform(merged_df)
-    print(f"FINAL FEATURE MATRIX: {merged_df.shape[0]} rows × {merged_df.shape[1]} columns")
 
-    print(f"\nFeatures created:\n{merged_df.columns.tolist()}")
+    print(f" FINAL MODEL-READY DATASET: {merged_df.shape[0]} customers × {merged_df.shape[1]} features")
+    print(f"   Target column: 'is_high_risk'")
     
     return merged_df
 
 
 if __name__ == "__main__":
-    # Test the complete pipeline
-    print("Testing Complete Feature Engineering Pipeline...\n")
+    # Test the complete pipeline with Task 4
+    print("Testing Complete Feature Engineering Pipeline (Tasks 3 & 4)...\n")
     
     # Load raw data
     df = pd.read_csv('data/raw/data.csv')
     print(f"Loaded: {df.shape[0]:,} transactions, {df.shape[1]} columns")
     
-    # Process features
+    # Process features with proxy target
     features = process_raw_data(df)
     
-    print(f"\nSample of final features:")
-    print(features.head(10))
+    print(f"\nFinal feature matrix preview (first 5 rows):")
+    print(features.head())
     
-    print(f"\nFeature statistics:")
-    print(features.describe())
+    print(f"\nFinal feature columns ({len(features.columns)} total):")
+    print(features.columns.tolist())
