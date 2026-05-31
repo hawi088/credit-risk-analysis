@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  credit-risk-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./best_model.pkl:/app/best_model.pkl
+    environment:
+      - PYTHONPATH=/app
+    restart: unless-stopped

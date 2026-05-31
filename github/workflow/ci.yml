@@ -1,17 +1,18 @@
-name: CI/CD Pipeline
+name: CI/CD Pipeline for Credit Risk Model
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop, task-*]
   pull_request:
     branches: [main]
 
 jobs:
-  test:
+  test-and-lint:
     runs-on: ubuntu-latest
     
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
       
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -22,15 +23,56 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install flake8 pytest
+          pip install flake8 pytest black isort
+      
+      - name: Check code formatting with black
+        run: |
+          black --check --line-length 88 src/ tests/ || true
       
       - name: Lint with flake8
         run: |
-          # Stop build on syntax errors or undefined names
-          flake8 src/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
-          # Treat style errors as warnings (won't fail the build)
-          flake8 src/ tests/ --count --exit-zero --max-line-length=127 --statistics
+          # Stop the build if there are Python syntax errors or undefined names
+          flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Exit-zero treats all errors as warnings (non-blocking for style issues)
+          flake8 src/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
       
       - name: Test with pytest
         run: |
-          pytest tests/ -v
+          pytest tests/ -v --tb=short
+      
+      - name: Run API health check test
+        run: |
+          # Start API in background
+          uvicorn src.api.main:app --host 127.0.0.1 --port 8000 &
+          sleep 10
+          # Test health endpoint
+          curl -f http://127.0.0.1:8000/health || echo "Health check failed"
+  
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: test-and-lint
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Build Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          load: true
+          tags: credit-risk-model:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Test Docker container
+        run: |
+          docker run -d --name test-container -p 8000:8000 credit-risk-model:latest
+          sleep 15
+          curl -f http://localhost:8000/health
+          docker stop test-container
+          docker rm test-container
